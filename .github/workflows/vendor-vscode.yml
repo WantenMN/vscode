@@ -1,0 +1,108 @@
+# Vendor: track upstream VSCode Insiders (Microsoft builds, no building here).
+#
+# This fork exists only as CI host + release storage; upstream code is never
+# built. Daily cron resolves the latest insider tarball URL (same redirect +
+# version discovery as a manual update check), prefetches its hash, fills
+# version/rev/name/url/hash into dist/nix/vscode-insiders.nix, verifies with
+# a real `nix build`, and uploads the file as the fixed-name pointer on the
+# rolling tag `rolling` (public repo, plain curl downloads).
+#
+# No versioned copies are kept: Microsoft's per-commit download URLs stay
+# valid, so old .nix versions in dotfiles history keep working without us
+# retaining anything.
+# dotfiles consumes the pointer via pkgs/update-fork-tarballs.sh.
+name: Vendor VSCode Insiders
+
+on:
+  schedule:
+    - cron: '0 2 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: vendor-vscode
+  cancel-in-progress: false
+
+env:
+  ROLL_TAG: rolling
+  NIX_ASSET: vscode-insiders.nix
+  NIXPKGS_TARBALL: https://channels.nixos.org/nixos-unstable/nixexprs.tar.zst
+
+jobs:
+  vendor:
+    name: Check, generate and publish drv
+    if: github.repository == 'WantenMN/vscode'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      # Sparse + shallow: this repo is huge and only dist/ is needed.
+      - name: Checkout vendor files
+        uses: actions/checkout@v6
+        with:
+          show-progress: false
+          fetch-depth: 1
+          sparse-checkout: |
+            dist
+            .github
+
+      - name: Install nix (hash + verification only)
+        uses: cachix/install-nix-action@8aa03977d8d733052d78f4e008a241fd1dbf36b3 # v31.10.6
+
+      - name: Resolve latest insider build
+        shell: bash --noprofile --norc -eo pipefail {0}
+        run: |
+          target="dist/nix/${NIX_ASSET}"
+          latest_url=$(curl -sIL -A "vscode-update-check" "https://update.code.visualstudio.com/latest/linux-x64/insider" \
+            | grep -i '^location: ' | tail -1 | tr -d '\r' | awk '{print $2}')
+          [ -n "$latest_url" ] || { echo "error: failed to resolve latest insider URL" >&2; exit 1; }
+
+          rev=$(echo "$latest_url" | sed -E 's|.*/insider/([0-9a-f]+)/.*|\1|')
+          version=$(curl -fsSL -A "vscode-update-check" "https://code.visualstudio.com/sha" \
+            | grep -o '"productVersion":"[^"]*-insider"' | head -1 | cut -d'"' -f4)
+
+          [ -n "$version" ] && [ -n "$rev" ] || { echo "error: failed to parse update info" >&2; exit 1; }
+          echo "version: $version"
+          echo "rev:     $rev"
+          echo "url:     $latest_url"
+          echo "latest_url=${latest_url}" >> "$GITHUB_ENV"
+          echo "rev=${rev}" >> "$GITHUB_ENV"
+          echo "version=${version}" >> "$GITHUB_ENV"
+
+          current_rev=$(grep -oP 'rev = "\K[0-9a-f]+' "$target" 2>/dev/null || true)
+          if [ "$current_rev" = "$rev" ]; then
+            echo "already up to date: $version ($rev)"
+            echo "up_to_date=true" >> "$GITHUB_ENV"
+          fi
+
+      - name: Generate verified .nix and publish pointer
+        if: env.up_to_date != 'true'
+        shell: bash --noprofile --norc -eo pipefail {0}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          target="dist/nix/${NIX_ASSET}"
+          tmp_tar="$RUNNER_TEMP/vscode-insiders.tar.gz"
+          curl -fsSL -A "vscode-update-check" -o "$tmp_tar" "$latest_url"
+          hash=$(nix hash file --sri "$tmp_tar")
+          echo "hash: $hash"
+          sed -i -E \
+            -e "s|version = \".*\";|version = \"${version}\";|" \
+            -e "s|rev = \".*\";|rev = \"${rev}\";|" \
+            -e "s|name = \"VSCode-Insiders-.*\";|name = \"VSCode-Insiders-${version}.tar.gz\";|" \
+            -e "s|url = \"https://vscode.download.*\";|url = \"${latest_url}\";|" \
+            -e "s|hash = \"sha256-.*\";|hash = \"${hash}\";|" \
+            "$target"
+          grep -nE 'version = |rev = |name = |url = |hash = ' "$target"
+          out=$(nix build -L --impure --no-link --print-out-paths --expr \
+            "let pkgs = import (builtins.fetchTarball { url = \"$NIXPKGS_TARBALL\"; }) { config.allowUnfree = true; }; in pkgs.callPackage ./$target {}")
+          echo "built: $out"
+          "$out/bin/code-insiders" --version | head -n 3
+          if ! gh release view "$ROLL_TAG" >/dev/null 2>&1; then
+            gh release create "$ROLL_TAG" \
+              --title "Vendor rolling pointers" \
+              --notes "Fixed-name vendored derivations (upstream builds, no fork). dotfiles consumes them via pkgs/update-fork-tarballs.sh." \
+              --target vendor
+          fi
+          gh release upload "$ROLL_TAG" "$target" --clobber
