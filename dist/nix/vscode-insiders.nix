@@ -1,11 +1,12 @@
 {
   buildVscode,
   fetchurl,
+  imagemagick,
   lib,
   stdenv,
 }:
 
-buildVscode {
+(buildVscode {
   pname = "vscode-insiders";
   executableName = "code-insiders";
   longName = "Visual Studio Code - Insiders";
@@ -33,4 +34,20 @@ buildVscode {
     license = lib.licenses.unfree;
     platforms = [ "x86_64-linux" ];
   };
-}
+}).overrideAttrs (oldAttrs: {
+  nativeBuildInputs = (oldAttrs.nativeBuildInputs or [ ]) ++ [ imagemagick ];
+  postInstall = (oldAttrs.postInstall or "") + ''
+    # Upstream tarball ships a single 1024px code.png; generic installs it
+    # only under hicolor/1024x1024, which hicolor-icon-theme does not list
+    # (max 512x512), so theme-compliant launchers such as fuzzel find no
+    # icon. Generate the standard sizes from the shipped pixmap.
+    for src in "$out"/share/pixmaps/*.png; do
+      [ -e "$src" ] || continue
+      icon="$(basename "$src")"
+      for size in 16 32 48 64 128 256 512; do
+        mkdir -p "$out/share/icons/hicolor/''${size}x''${size}/apps"
+        convert "$src" -resize "''${size}x''${size}" "$out/share/icons/hicolor/''${size}x''${size}/apps/$icon"
+      done
+    done
+  '';
+})
